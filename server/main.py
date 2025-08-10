@@ -52,6 +52,10 @@ async def _safe_send(client: WebSocketServerProtocol, message_text: str) -> None
         connected_clients.discard(client)
 
 
+async def broadcast_clients_count() -> None:
+    await broadcast_json({"type": "clients", "count": len(connected_clients)})
+
+
 async def handle_connection(websocket: WebSocketServerProtocol) -> None:
     connected_clients.add(websocket)
     try:
@@ -62,10 +66,13 @@ async def handle_connection(websocket: WebSocketServerProtocol) -> None:
                     "type": "hello",
                     "width": CANVAS_WIDTH,
                     "height": CANVAS_HEIGHT,
+                    "clients": len(connected_clients),
                 },
                 separators=(",", ":"),
             )
         )
+        # Notify everyone about updated client count
+        await broadcast_clients_count()
 
         async for raw_message in websocket:
             # Support plain ping string for backward compatibility
@@ -149,6 +156,8 @@ async def handle_connection(websocket: WebSocketServerProtocol) -> None:
 
     finally:
         connected_clients.discard(websocket)
+        # Notify remaining clients about updated client count
+        await broadcast_clients_count()
 
 
 async def main() -> None:

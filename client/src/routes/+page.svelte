@@ -3,7 +3,17 @@
   import { hexToRgb, type RGB } from '$lib/utils/color';
 
   let ws: WebSocket | null = null;
-  let status: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+  let status: 'disconnected' | 'connecting' | 'connected' | 'retrying' = 'disconnected';
+  let clientCount: number | null = null;
+
+  // heartbeat & reconnect
+  const pingEveryMs = 5000;
+  const pongTimeoutMs = 3000;
+  const maxReconnectAttempts = 5;
+  let pingIntervalId: number | null = null;
+  let pongTimeoutId: number | null = null;
+  let awaitingPong = false;
+  let reconnectAttempts = 0;
   let width = 0;
   let height = 0;
   let scale = 1; // zoom factor
@@ -30,17 +40,20 @@
       ws = new WebSocket('ws://localhost:8765');
     } catch (e) {
       console.error(e);
-      status = 'disconnected';
+      scheduleReconnect();
       return;
     }
 
     ws.addEventListener('open', () => {
       status = 'connected';
+      reconnectAttempts = 0;
+      startHeartbeat();
       ws?.send(JSON.stringify({ type: 'get_canvas' }));
     });
 
     ws.addEventListener('close', () => {
-      status = 'disconnected';
+      stopHeartbeat();
+      scheduleReconnect();
     });
 
     ws.addEventListener('message', (ev) => {
@@ -48,9 +61,61 @@
         const msg = JSON.parse(ev.data);
         handleMessage(msg);
       } catch (e) {
-        // ignore non-JSON (like ping)
+        // ignore non-JSON
       }
     });
+
+    ws.addEventListener('error', () => {
+      // Treat as a close to trigger reconnect logic
+      try { ws?.close(); } catch {}
+    });
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    awaitingPong = false;
+    pingIntervalId = window.setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (awaitingPong) {
+        // No pong from previous ping — force reconnect
+        try { ws.close(); } catch {}
+        return;
+      }
+      awaitingPong = true;
+      ws.send(JSON.stringify({ type: 'ping' }));
+      if (pongTimeoutId) clearTimeout(pongTimeoutId);
+      pongTimeoutId = window.setTimeout(() => {
+        // If still awaiting, drop connection to trigger reconnect
+        if (awaitingPong) {
+          try { ws?.close(); } catch {}
+        }
+      }, pongTimeoutMs);
+    }, pingEveryMs);
+  }
+
+  function stopHeartbeat() {
+    if (pingIntervalId) {
+      clearInterval(pingIntervalId);
+      pingIntervalId = null;
+    }
+    if (pongTimeoutId) {
+      clearTimeout(pongTimeoutId);
+      pongTimeoutId = null;
+    }
+    awaitingPong = false;
+  }
+
+  function scheduleReconnect() {
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      status = 'disconnected';
+      return;
+    }
+    reconnectAttempts += 1;
+    status = 'retrying';
+    const delayMs = Math.min(5000, 1000 * reconnectAttempts);
+    setTimeout(() => {
+      connect();
+    }, delayMs);
   }
 
   function ensureOffscreen(w: number, h: number) {
@@ -71,6 +136,7 @@
     if (msg.type === 'hello') {
       width = msg.width;
       height = msg.height;
+      if (typeof msg.clients === 'number') clientCount = msg.clients;
       setupCanvas();
     } else if (msg.type === 'canvas') {
       if (!width || !height) {
@@ -81,6 +147,14 @@
       drawFullCanvas(msg.data as RGB[][]);
     } else if (msg.type === 'pixel_update') {
       plotPixel(msg.x, msg.y, msg.color as RGB);
+    } else if (msg.type === 'clients') {
+      if (typeof msg.count === 'number') clientCount = msg.count;
+    } else if (msg.type === 'pong') {
+      awaitingPong = false;
+      if (pongTimeoutId) {
+        clearTimeout(pongTimeoutId);
+        pongTimeoutId = null;
+      }
     }
   }
 
@@ -281,7 +355,8 @@
     window.addEventListener('resize', onResize);
     return () => {
       window.removeEventListener('resize', onResize);
-      ws?.close();
+      stopHeartbeat();
+      try { ws?.close(); } catch {}
     };
   });
 </script>
@@ -290,9 +365,10 @@
   <header class="flex items-center gap-4 border-b border-white/10 px-4 py-2">
     <h1 class="text-lg font-semibold">Pixel Party</h1>
     <div class="ml-auto flex items-center gap-3 text-sm">
-      <span class={status === 'connected' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : 'text-rose-400'}>
-        {status}
+      <span class={status === 'connected' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : status === 'retrying' ? 'text-amber-400' : 'text-rose-400'}>
+        {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts}/${maxReconnectAttempts})` : status}
       </span>
+      <span class="text-white/70">{clientCount !== null ? `clients: ${clientCount}` : ''}</span>
       <input type="color" bind:value={colorHex} class="h-7 w-10 cursor-pointer rounded border border-white/10 bg-transparent p-0" title="Pick color" />
       <button class="rounded bg-white/10 px-2 py-1 hover:bg-white/20" on:click={centerView}>Center</button>
       <div class="flex items-center gap-1">
