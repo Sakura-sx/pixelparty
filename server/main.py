@@ -4,7 +4,7 @@ import asyncio
 import json
 from typing import List, Set
 
-from websockets.asyncio.server import serve, WebSocketServerProtocol
+from websockets.legacy.server import serve, WebSocketServerProtocol
 
 
 # Canvas configuration
