@@ -37,7 +37,8 @@
   function connect() {
     status = 'connecting';
     try {
-      ws = new WebSocket('ws://localhost:8765');
+      const url = `ws://${window.location.hostname}:8765`;
+      ws = new WebSocket(url);
     } catch (e) {
       console.error(e);
       scheduleReconnect();
@@ -241,18 +242,23 @@
     if (scale >= 12) {
       ctx.save();
       ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-      for (let x = 0; x <= sw; x++) {
-        const gx = Math.floor(x * scale - (camX % scale));
+      // Align grid to pixel boundaries
+      const startX = Math.floor(camX / scale);
+      const startY = Math.floor(camY / scale);
+      const endX = startX + Math.ceil(viewW / scale);
+      const endY = startY + Math.ceil(viewH / scale);
+      for (let x = startX; x <= endX; x++) {
+        const gx = Math.round((x * scale) - camX) + 0.5;
         ctx.beginPath();
-        ctx.moveTo(gx + 0.5, 0);
-        ctx.lineTo(gx + 0.5, viewH);
+        ctx.moveTo(gx, 0);
+        ctx.lineTo(gx, viewH);
         ctx.stroke();
       }
-      for (let y = 0; y <= sh; y++) {
-        const gy = Math.floor(y * scale - (camY % scale));
+      for (let y = startY; y <= endY; y++) {
+        const gy = Math.round((y * scale) - camY) + 0.5;
         ctx.beginPath();
-        ctx.moveTo(0, gy + 0.5);
-        ctx.lineTo(viewW, gy + 0.5);
+        ctx.moveTo(0, gy);
+        ctx.lineTo(viewW, gy);
         ctx.stroke();
       }
       ctx.restore();
@@ -305,13 +311,21 @@
     }
   }
 
+  let isDrawing = false;
+  let lastDrawX: number | null = null;
+  let lastDrawY: number | null = null;
+
   function onMouseDown(e: MouseEvent) {
     if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
       isPanning = true;
       lastPanX = e.clientX;
       lastPanY = e.clientY;
     } else if (e.button === 0) {
-      placeAtEvent(e);
+      isDrawing = true;
+      const { x, y } = canvasToPixel(e.clientX, e.clientY);
+      lastDrawX = x;
+      lastDrawY = y;
+      placePixel(x, y);
     }
   }
   function onMouseMove(e: MouseEvent) {
@@ -324,15 +338,25 @@
       camY -= dy;
       clampCamera();
       requestFrame();
+    } else if (isDrawing) {
+      const { x, y } = canvasToPixel(e.clientX, e.clientY);
+      // Only send if position changed
+      if (x !== lastDrawX || y !== lastDrawY) {
+        lastDrawX = x;
+        lastDrawY = y;
+        placePixel(x, y);
+      }
     }
   }
   function onMouseUp() {
     isPanning = false;
+    isDrawing = false;
+    lastDrawX = null;
+    lastDrawY = null;
   }
 
-  function placeAtEvent(e: MouseEvent) {
+  function placePixel(x: number, y: number) {
     if (!ws || status !== 'connected') return;
-    const { x, y } = canvasToPixel(e.clientX, e.clientY);
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     const color = hexToRgb(colorHex);
     ws.send(JSON.stringify({ type: 'set_pixel', x, y, color }));
