@@ -229,36 +229,52 @@
     canvasEl.height = viewH;
 
     ctx.imageSmoothingEnabled = false;
+
     const sx = Math.floor(camX / scale);
     const sy = Math.floor(camY / scale);
-    const sw = Math.ceil(viewW / scale);
-    const sh = Math.ceil(viewH / scale);
-    // draw the portion of the offscreen onto the visible canvas
-    ctx.clearRect(0, 0, viewW, viewH);
-    // @ts-ignore drawImage works for OffscreenCanvas & HTMLCanvasElement
-    ctx.drawImage(offscreen as any, sx, sy, sw, sh, 0, 0, sw * scale, sh * scale);
+    const sw = Math.ceil(viewW / scale) + 1; // Add 1 to prevent edge artifacts
+    const sh = Math.ceil(viewH / scale) + 1; // Add 1 to prevent edge artifacts
 
-    // grid when zoomed in
+    // Calculate the destination offset to account for fractional camera positions
+    const dx = -(camX - sx * scale);
+    const dy = -(camY - sy * scale);
+
+    ctx.clearRect(0, 0, viewW, viewH);
+    // Draw the portion of the offscreen canvas, now correctly offset
+    // @ts-ignore drawImage works for OffscreenCanvas & HTMLCanvasElement
+    ctx.drawImage(offscreen as any, sx, sy, sw, sh, dx, dy, sw * scale, sh * scale);
+
+    // Grid when zoomed in
     if (scale >= 12) {
       ctx.save();
       ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-      // Align grid to pixel boundaries
-      const startX = Math.floor(camX / scale);
-      const startY = Math.floor(camY / scale);
-      const endX = startX + Math.ceil(viewW / scale);
-      const endY = startY + Math.ceil(viewH / scale);
-      for (let x = startX; x <= endX; x++) {
-        const gx = Math.round((x * scale) - camX) + 0.5;
+      ctx.lineWidth = 1;
+
+      // The first visible vertical grid line's world coordinate
+      const startGridX = Math.floor(camX / scale);
+      // The last visible vertical grid line's world coordinate
+      const endGridX = startGridX + Math.ceil(viewW / scale);
+
+      for (let x = startGridX; x <= endGridX; x++) {
+        // Calculate the precise screen position and add 0.5 for a crisp line
+        const screenX = (x * scale) - camX;
         ctx.beginPath();
-        ctx.moveTo(gx, 0);
-        ctx.lineTo(gx, viewH);
+        ctx.moveTo(screenX + 0.5, 0);
+        ctx.lineTo(screenX + 0.5, viewH);
         ctx.stroke();
       }
-      for (let y = startY; y <= endY; y++) {
-        const gy = Math.round((y * scale) - camY) + 0.5;
+
+      // The first visible horizontal grid line's world coordinate
+      const startGridY = Math.floor(camY / scale);
+      // The last visible horizontal grid line's world coordinate
+      const endGridY = startGridY + Math.ceil(viewH / scale);
+
+      for (let y = startGridY; y <= endGridY; y++) {
+        // Calculate the precise screen position and add 0.5 for a crisp line
+        const screenY = (y * scale) - camY;
         ctx.beginPath();
-        ctx.moveTo(0, gy);
-        ctx.lineTo(viewW, gy);
+        ctx.moveTo(0, screenY + 0.5);
+        ctx.lineTo(viewW, screenY + 0.5);
         ctx.stroke();
       }
       ctx.restore();
