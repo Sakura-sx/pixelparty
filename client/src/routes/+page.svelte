@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { hexToRgb, type RGB } from '$lib/utils/color';
+  import { browser } from '$app/environment';
 
   let ws: WebSocket | null = null;
   let status: 'disconnected' | 'connecting' | 'connected' | 'retrying' = 'disconnected';
@@ -32,7 +33,11 @@
   let lastPanY = 0;
 
   // current color
-  let colorHex = '#ff0000';
+  function randomHex(): string {
+    const n = Math.floor(Math.random() * 0xffffff);
+    return '#' + n.toString(16).padStart(6, '0');
+  }
+  let colorHex = browser ? randomHex() : '#ff0000';
 
   function connect() {
     status = 'connecting';
