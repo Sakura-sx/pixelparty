@@ -105,4 +105,6 @@ httpServer.listen(PORT, () => {
   console.log(`pixelparty server listening on :${PORT}`);
 });
 
-export default app;
+// No default export on purpose: exporting the app makes Vercel wrap it in its
+// own server, bypassing httpServer and the Socket.IO instance attached to it.
+// Without an export, Vercel uses the port listener above and runs this server.
