@@ -46,7 +46,9 @@
     socket.on('connect', () => {
       status = 'connected';
       reconnectAttempts = 0;
-      socket?.emit('get_canvas');
+      snapshotReady = false;
+      pxBacklog = [];
+      void loadSnapshot();
       startPing();
     });
 
@@ -68,6 +70,7 @@
       setupCanvas();
     });
 
+    // Fallback snapshot path over the socket (used if the HTTP fetch fails)
     socket.on('canvas', async (msg: { width: number; height: number; data: ArrayBuffer }) => {
       if (!width || !height) {
         width = msg.width;
@@ -76,14 +79,21 @@
       }
       try {
         const bytes = await inflate(msg.data);
-        drawFullCanvas(bytes);
+        finishSnapshot(bytes);
       } catch (e) {
         console.error('Failed to decode canvas snapshot', e);
       }
     });
 
-    socket.on('pixel_update', (msg: { x: number; y: number; color: RGB }) => {
-      plotPixel(msg.x, msg.y, msg.color);
+    // Tier 1 -> tier 2: coalesced binary chunk of pixel updates. Chunks that
+    // arrive before the snapshot is applied are buffered, otherwise the
+    // (older) snapshot would overwrite them.
+    socket.on('px', (data: ArrayBuffer) => {
+      if (!snapshotReady) {
+        pxBacklog.push(data);
+        return;
+      }
+      applyPxChunk(data);
     });
 
     socket.on('clients', (count: number) => {
@@ -119,6 +129,78 @@
   async function inflate(buf: ArrayBuffer): Promise<Uint8Array> {
     const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('deflate'));
     return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  // --- snapshot + binary pixel protocol ---
+  // px chunks are 6 bytes per pixel: 24-bit big-endian index (y*width+x), r, g, b
+  const PX_RECORD = 6;
+  const FLUSH_MS = 50;
+  let snapshotReady = false;
+  let pxBacklog: ArrayBuffer[] = [];
+
+  // Full refresh over HTTP: the body is the raw RGB framebuffer and the
+  // browser's native decoder handles Content-Encoding (brotli/deflate), so
+  // this is both the cheapest decode and the smallest transfer.
+  async function loadSnapshot() {
+    try {
+      const base = dev ? 'http://localhost:8765' : '';
+      const res = await fetch(`${base}/snapshot`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!width || !height) {
+        width = Number(res.headers.get('x-canvas-width')) || 512;
+        height = Number(res.headers.get('x-canvas-height')) || 512;
+        setupCanvas();
+      }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length !== width * height * 3) throw new Error(`bad snapshot size ${bytes.length}`);
+      finishSnapshot(bytes);
+    } catch (e) {
+      console.warn('HTTP snapshot failed, falling back to socket', e);
+      socket?.emit('get_canvas');
+    }
+  }
+
+  function finishSnapshot(bytes: Uint8Array) {
+    drawFullCanvas(bytes);
+    snapshotReady = true;
+    const backlog = pxBacklog;
+    pxBacklog = [];
+    for (const chunk of backlog) applyPxChunk(chunk);
+  }
+
+  function applyPxChunk(data: ArrayBuffer) {
+    const b = new Uint8Array(data);
+    for (let off = 0; off + PX_RECORD <= b.length; off += PX_RECORD) {
+      const index = (b[off] << 16) | (b[off + 1] << 8) | b[off + 2];
+      plotPixel(index % width, Math.floor(index / width), [b[off + 3], b[off + 4], b[off + 5]]);
+    }
+  }
+
+  // Tier 2 -> tier 1: pixels drawn locally are painted immediately and queued
+  // (deduped per pixel), then sent as one binary chunk per 50ms window.
+  let pending = new Map<number, RGB>();
+  let flushTimer: number | null = null;
+
+  function flushPending() {
+    flushTimer = null;
+    if (pending.size === 0) return;
+    if (!socket?.connected) {
+      pending.clear();
+      return;
+    }
+    const buf = new Uint8Array(pending.size * PX_RECORD);
+    let off = 0;
+    for (const [index, [r, g, b]] of pending) {
+      buf[off] = index >> 16;
+      buf[off + 1] = (index >> 8) & 0xff;
+      buf[off + 2] = index & 0xff;
+      buf[off + 3] = r;
+      buf[off + 4] = g;
+      buf[off + 5] = b;
+      off += PX_RECORD;
+    }
+    pending.clear();
+    socket.emit('px', buf);
   }
 
   function ensureOffscreen(w: number, h: number) {
@@ -346,7 +428,9 @@
     if (!socket?.connected) return;
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     const color = hexToRgb(colorHex);
-    socket.emit('set_pixel', { x, y, color });
+    plotPixel(x, y, color); // tier 2: immediate local feedback
+    pending.set(y * width + x, color);
+    if (flushTimer === null) flushTimer = window.setTimeout(flushPending, FLUSH_MS);
   }
 
   function centerView() {
@@ -367,6 +451,7 @@
     return () => {
       window.removeEventListener('resize', onResize);
       stopPing();
+      if (flushTimer !== null) clearTimeout(flushTimer);
       socket?.disconnect();
       socket = null;
     };

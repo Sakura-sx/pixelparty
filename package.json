@@ -6,11 +6,12 @@
 	"main": "server/index.js",
 	"scripts": {
 		"build": "cd client && npx pnpm@10 install && npx pnpm@10 run build",
-		"start": "node server/index.js",
-		"dev:server": "node server/index.js",
+		"start": "node --env-file-if-exists=.env.local server/index.js",
+		"dev:server": "node --env-file-if-exists=.env.local server/index.js",
 		"dev:client": "cd client && pnpm dev"
 	},
 	"dependencies": {
+		"@vercel/blob": "^2.4.0",
 		"express": "^5.1.0",
 		"socket.io": "^4.8.1"
 	}
