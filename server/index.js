@@ -54,6 +54,17 @@ const pendingBroadcast = new Map();
 const dirtyPixels = new Map();
 let persistingBatch = null; // dirty pixels currently being pushed upstream
 
+// Diagnostics for /healthz
+const BOOT_AT = Date.now();
+const stats = {
+  pixelsWritten: 0, // through this instance (sockets), since boot
+  deltasPushed: 0,
+  pixelsAdopted: 0, // taken from tier 0 (other instances' work)
+  compactions: 0,
+  syncFailures: 0,
+  lastSyncAt: null
+};
+
 function ownedLocally(index) {
   return dirtyPixels.has(index) || persistingBatch?.has(index);
 }
@@ -71,6 +82,7 @@ function writePixel(index, r, g, b) {
   invalidateSnapshots();
   pendingBroadcast.set(index, (r << 16) | (g << 8) | b);
   dirtyPixels.set(index, (r << 16) | (g << 8) | b);
+  stats.pixelsWritten++;
 }
 
 // Applies a binary px chunk; returns an error code or null. The chunk is
@@ -123,7 +135,24 @@ const io = new Server(httpServer, {
 });
 
 app.get('/healthz', (req, res) => {
-  res.json({ ok: true, clients: io.engine.clientsCount });
+  let paintedPixels = 0;
+  for (let i = 0; i < canvas.length; i += 3) {
+    if (canvas[i] || canvas[i + 1] || canvas[i + 2]) paintedPixels++;
+  }
+  res.json({
+    ok: true,
+    region: process.env.VERCEL_REGION ?? 'dev',
+    clients: io.engine.clientsCount,
+    uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000),
+    canvas: { width: CANVAS_WIDTH, height: CANVAS_HEIGHT, paintedPixels },
+    tier0: {
+      enabled: storeEnabled(),
+      dirtyPixels: dirtyPixels.size,
+      pendingBroadcast: pendingBroadcast.size,
+      lastSyncAgoMs: stats.lastSyncAt === null ? null : Date.now() - stats.lastSyncAt,
+      ...stats
+    }
+  });
 });
 
 // Full canvas refresh. The body is the raw RGB framebuffer; compression is
@@ -266,13 +295,15 @@ let lastPull = 0;
 async function syncTier0() {
   const state = await pullState();
   lastPull = Date.now();
-  applyRemoteState(state);
+  stats.lastSyncAt = lastPull;
+  stats.pixelsAdopted += applyRemoteState(state);
 
   if (dirtyPixels.size > 0) {
     persistingBatch = new Map(dirtyPixels);
     dirtyPixels.clear();
     try {
       await pushDelta(encodeChunk(persistingBatch));
+      stats.deltasPushed++;
     } catch (err) {
       // Re-mark for the next cycle, unless the pixel was drawn again since
       for (const [index, rgb] of persistingBatch) {
@@ -288,6 +319,7 @@ async function syncTier0() {
   // incomplete view of the deltas
   if (state.complete && state.deltaCount >= COMPACT_AFTER_DELTAS) {
     await compact(getDeflatedSnapshot());
+    stats.compactions++;
   }
 }
 
@@ -301,6 +333,7 @@ if (storeEnabled()) {
     try {
       await syncTier0();
     } catch (err) {
+      stats.syncFailures++;
       console.error('tier 0 sync failed:', err.message);
     } finally {
       syncing = false;
@@ -320,11 +353,22 @@ if (storeEnabled()) {
   }
 }
 
-const PORT = process.env.PORT || 8765;
-httpServer.listen(PORT, () => {
-  console.log(`pixelparty server listening on :${PORT}`);
-});
+// On Vercel the launcher listens on the exported server itself; calling
+// listen here as well makes every request hang. Self-listen only when run
+// directly (local dev / other hosts).
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 8765;
+  httpServer.listen(PORT, () => {
+    console.log(`pixelparty server listening on :${PORT}`);
+  });
+}
 
-// No default export on purpose: exporting the app makes Vercel wrap it in its
-// own server, bypassing httpServer and the Socket.IO instance attached to it.
-// Without an export, Vercel uses the port listener above and runs this server.
+// Export the http server (NOT the express app): Vercel's launcher serves the
+// default export, and exporting `app` would wrap it in a fresh server,
+// bypassing the Socket.IO instance attached to httpServer.
+export default httpServer;
+
+// Read statically by Vercel's builder (the vercel.json `functions` block is
+// ignored by the express preset). Longer-lived function = websockets survive
+// longer before a forced reconnect.
+export const config = { maxDuration: 800 };
