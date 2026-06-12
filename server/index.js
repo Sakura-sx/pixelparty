@@ -160,7 +160,8 @@ io.on('connection', (socket) => {
   socket.emit('hello', {
     width: CANVAS_WIDTH,
     height: CANVAS_HEIGHT,
-    clients: io.engine.clientsCount
+    clients: io.engine.clientsCount,
+    region: process.env.VERCEL_REGION ?? 'dev'
   });
   io.emit('clients', io.engine.clientsCount);
 

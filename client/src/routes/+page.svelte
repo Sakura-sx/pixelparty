@@ -7,6 +7,7 @@
   let socket: Socket | null = null;
   let status: 'disconnected' | 'connecting' | 'connected' | 'retrying' = 'disconnected';
   let transport: string | null = null; // 'polling' | 'websocket' | 'webtransport'
+  let region: string | null = null; // Vercel region the function runs in
   let clientCount: number | null = null;
   let reconnectAttempts = 0;
 
@@ -81,10 +82,11 @@
       reconnectAttempts = attempt;
     });
 
-    socket.on('hello', (msg: { width: number; height: number; clients?: number }) => {
+    socket.on('hello', (msg: { width: number; height: number; clients?: number; region?: string }) => {
       width = msg.width;
       height = msg.height;
       if (typeof msg.clients === 'number') clientCount = msg.clients;
+      region = msg.region ?? null;
       setupCanvas();
     });
 
@@ -480,15 +482,22 @@
   <header class="flex items-center gap-4 border-b border-white/10 px-4 py-2">
     <h1 class="text-lg font-semibold">Pixel Party</h1>
     <div class="ml-auto flex items-center gap-3 text-sm">
-      <span class={status === 'connected' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : status === 'retrying' ? 'text-amber-400' : 'text-rose-400'}>
-        {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts})` : status}
-      </span>
-      {#if transport}
-        <span class="rounded bg-white/10 px-1.5 py-0.5 text-xs text-white/70" title="Active transport">{transport}</span>
-      {/if}
-      {#if pingMs !== null}
-        <span class={pingMs < 80 ? 'text-emerald-400' : pingMs < 200 ? 'text-amber-400' : 'text-rose-400'} title="Round-trip latency">
-          {pingMs}ms
+      {#if status === 'connected' && transport}
+        <span class="flex items-center gap-1 text-white/70">
+          Connected over {transport} to
+          <svg viewBox="0 0 76 65" class="h-2.5 w-2.5 fill-current" aria-label="Vercel" role="img">
+            <path d="M37.59.25l36.95 64H.64l36.95-64z" />
+          </svg>
+          {region ?? '…'}
+        </span>
+        {#if pingMs !== null}
+          <span class={pingMs < 80 ? 'text-emerald-400' : pingMs < 200 ? 'text-amber-400' : 'text-rose-400'} title="Round-trip latency">
+            {pingMs}ms
+          </span>
+        {/if}
+      {:else}
+        <span class={status === 'connecting' || status === 'retrying' ? 'text-amber-400' : 'text-rose-400'}>
+          {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts})` : status}
         </span>
       {/if}
       <span class="text-white/70">{clientCount !== null ? `clients: ${clientCount}` : ''}</span>
