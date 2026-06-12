@@ -41,8 +41,18 @@
 
   function connect() {
     status = 'connecting';
+    // Websocket first: socket.io's default polling-first handshake needs
+    // every poll request to reach the same server instance, and Vercel
+    // doesn't do sticky routing — polls land on other instances, get
+    // "Session ID unknown" and the connection dies until a websocket (one
+    // pinned TCP connection) happens to complete. Polling stays as a
+    // last-resort fallback for networks that block websockets.
+    const opts = {
+      transports: ['websocket', 'polling'],
+      tryAllTransports: true
+    };
     // In dev the API server runs separately on :8765; in production it's same-origin
-    socket = dev ? io('http://localhost:8765') : io();
+    socket = dev ? io('http://localhost:8765', opts) : io(opts);
 
     socket.on('connect', () => {
       status = 'connected';
