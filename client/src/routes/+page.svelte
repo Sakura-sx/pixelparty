@@ -1,20 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { io, type Socket } from 'socket.io-client';
+  import { dev } from '$app/environment';
   import { hexToRgb, type RGB } from '$lib/utils/color';
-  import { browser } from '$app/environment';
 
-  let ws: WebSocket | null = null;
+  let socket: Socket | null = null;
   let status: 'disconnected' | 'connecting' | 'connected' | 'retrying' = 'disconnected';
   let clientCount: number | null = null;
-
-  // heartbeat & reconnect
-  const pingEveryMs = 5000;
-  const pongTimeoutMs = 3000;
-  const maxReconnectAttempts = 5;
-  let pingIntervalId: number | null = null;
-  let pongTimeoutId: number | null = null;
-  let awaitingPong = false;
   let reconnectAttempts = 0;
+
+  // latency probe
+  const pingEveryMs = 3000;
+  let pingMs: number | null = null;
+  let pingIntervalId: number | null = null;
+
   let width = 0;
   let height = 0;
   let scale = 1; // zoom factor
@@ -37,91 +36,89 @@
     const n = Math.floor(Math.random() * 0xffffff);
     return '#' + n.toString(16).padStart(6, '0');
   }
-  let colorHex = browser ? randomHex() : '#ff0000';
+  let colorHex = randomHex();
 
   function connect() {
     status = 'connecting';
-    try {
-      const url = `ws://${window.location.hostname}:8765`;
-      ws = new WebSocket(url);
-    } catch (e) {
-      console.error(e);
-      scheduleReconnect();
-      return;
-    }
+    // In dev the API server runs separately on :8765; in production it's same-origin
+    socket = dev ? io('http://localhost:8765') : io();
 
-    ws.addEventListener('open', () => {
+    socket.on('connect', () => {
       status = 'connected';
       reconnectAttempts = 0;
-      startHeartbeat();
-      ws?.send(JSON.stringify({ type: 'get_canvas' }));
+      socket?.emit('get_canvas');
+      startPing();
     });
 
-    ws.addEventListener('close', () => {
-      stopHeartbeat();
-      scheduleReconnect();
+    socket.on('disconnect', () => {
+      status = 'disconnected';
+      pingMs = null;
+      stopPing();
     });
 
-    ws.addEventListener('message', (ev) => {
+    socket.io.on('reconnect_attempt', (attempt) => {
+      status = 'retrying';
+      reconnectAttempts = attempt;
+    });
+
+    socket.on('hello', (msg: { width: number; height: number; clients?: number }) => {
+      width = msg.width;
+      height = msg.height;
+      if (typeof msg.clients === 'number') clientCount = msg.clients;
+      setupCanvas();
+    });
+
+    socket.on('canvas', async (msg: { width: number; height: number; data: ArrayBuffer }) => {
+      if (!width || !height) {
+        width = msg.width;
+        height = msg.height;
+        setupCanvas();
+      }
       try {
-        const msg = JSON.parse(ev.data);
-        handleMessage(msg);
+        const bytes = await inflate(msg.data);
+        drawFullCanvas(bytes);
       } catch (e) {
-        // ignore non-JSON
+        console.error('Failed to decode canvas snapshot', e);
       }
     });
 
-    ws.addEventListener('error', () => {
-      // Treat as a close to trigger reconnect logic
-      try { ws?.close(); } catch {}
+    socket.on('pixel_update', (msg: { x: number; y: number; color: RGB }) => {
+      plotPixel(msg.x, msg.y, msg.color);
+    });
+
+    socket.on('clients', (count: number) => {
+      if (typeof count === 'number') clientCount = count;
+    });
+
+    socket.on('error_msg', (msg: { error: string; message: string }) => {
+      console.warn('server error:', msg.error, msg.message);
     });
   }
 
-  function startHeartbeat() {
-    stopHeartbeat();
-    awaitingPong = false;
-    pingIntervalId = window.setInterval(() => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (awaitingPong) {
-        // No pong from previous ping — force reconnect
-        try { ws.close(); } catch {}
-        return;
-      }
-      awaitingPong = true;
-      ws.send(JSON.stringify({ type: 'ping' }));
-      if (pongTimeoutId) clearTimeout(pongTimeoutId);
-      pongTimeoutId = window.setTimeout(() => {
-        // If still awaiting, drop connection to trigger reconnect
-        if (awaitingPong) {
-          try { ws?.close(); } catch {}
-        }
-      }, pongTimeoutMs);
-    }, pingEveryMs);
+  function startPing() {
+    stopPing();
+    const sendPing = () => {
+      if (!socket?.connected) return;
+      const start = performance.now();
+      socket.timeout(5000).emit('latency', (err: unknown) => {
+        if (!err) pingMs = Math.round(performance.now() - start);
+      });
+    };
+    sendPing();
+    pingIntervalId = window.setInterval(sendPing, pingEveryMs);
   }
 
-  function stopHeartbeat() {
+  function stopPing() {
     if (pingIntervalId) {
       clearInterval(pingIntervalId);
       pingIntervalId = null;
     }
-    if (pongTimeoutId) {
-      clearTimeout(pongTimeoutId);
-      pongTimeoutId = null;
-    }
-    awaitingPong = false;
   }
 
-  function scheduleReconnect() {
-    if (reconnectAttempts >= maxReconnectAttempts) {
-      status = 'disconnected';
-      return;
-    }
-    reconnectAttempts += 1;
-    status = 'retrying';
-    const delayMs = Math.min(5000, 1000 * reconnectAttempts);
-    setTimeout(() => {
-      connect();
-    }, delayMs);
+  // Snapshots arrive as zlib-deflated RGB bytes (lossless); inflate them natively
+  async function inflate(buf: ArrayBuffer): Promise<Uint8Array> {
+    const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('deflate'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
   }
 
   function ensureOffscreen(w: number, h: number) {
@@ -138,32 +135,6 @@
     }
   }
 
-  function handleMessage(msg: any) {
-    if (msg.type === 'hello') {
-      width = msg.width;
-      height = msg.height;
-      if (typeof msg.clients === 'number') clientCount = msg.clients;
-      setupCanvas();
-    } else if (msg.type === 'canvas') {
-      if (!width || !height) {
-        width = msg.width;
-        height = msg.height;
-        setupCanvas();
-      }
-      drawFullCanvas(msg.data as RGB[][]);
-    } else if (msg.type === 'pixel_update') {
-      plotPixel(msg.x, msg.y, msg.color as RGB);
-    } else if (msg.type === 'clients') {
-      if (typeof msg.count === 'number') clientCount = msg.count;
-    } else if (msg.type === 'pong') {
-      awaitingPong = false;
-      if (pongTimeoutId) {
-        clearTimeout(pongTimeoutId);
-        pongTimeoutId = null;
-      }
-    }
-  }
-
   function setupCanvas() {
     if (!canvasEl) return;
     ctx = canvasEl.getContext('2d');
@@ -177,7 +148,7 @@
     requestFrame();
   }
 
-  function drawFullCanvas(data: RGB[][]) {
+  function drawFullCanvas(bytes: Uint8Array) {
     if (!offctx) return;
     const imageCtx = offctx as CanvasRenderingContext2D;
     // Ensure the offscreen has correct size (in case of server resize in future)
@@ -189,16 +160,11 @@
       (offscreen as any).height = height;
     }
     const imgData = imageCtx.createImageData(width, height);
-    let i = 0;
-    for (let y = 0; y < height; y++) {
-      const row = data[y];
-      for (let x = 0; x < width; x++) {
-        const [r, g, b] = row[x];
-        imgData.data[i++] = r;
-        imgData.data[i++] = g;
-        imgData.data[i++] = b;
-        imgData.data[i++] = 255;
-      }
+    for (let p = 0, i = 0; p < bytes.length; p += 3) {
+      imgData.data[i++] = bytes[p];
+      imgData.data[i++] = bytes[p + 1];
+      imgData.data[i++] = bytes[p + 2];
+      imgData.data[i++] = 255;
     }
     imageCtx.putImageData(imgData, 0, 0);
     requestFrame();
@@ -377,10 +343,10 @@
   }
 
   function placePixel(x: number, y: number) {
-    if (!ws || status !== 'connected') return;
+    if (!socket?.connected) return;
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     const color = hexToRgb(colorHex);
-    ws.send(JSON.stringify({ type: 'set_pixel', x, y, color }));
+    socket.emit('set_pixel', { x, y, color });
   }
 
   function centerView() {
@@ -400,8 +366,9 @@
     window.addEventListener('resize', onResize);
     return () => {
       window.removeEventListener('resize', onResize);
-      stopHeartbeat();
-      try { ws?.close(); } catch {}
+      stopPing();
+      socket?.disconnect();
+      socket = null;
     };
   });
 </script>
@@ -411,8 +378,13 @@
     <h1 class="text-lg font-semibold">Pixel Party</h1>
     <div class="ml-auto flex items-center gap-3 text-sm">
       <span class={status === 'connected' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : status === 'retrying' ? 'text-amber-400' : 'text-rose-400'}>
-        {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts}/${maxReconnectAttempts})` : status}
+        {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts})` : status}
       </span>
+      {#if pingMs !== null}
+        <span class={pingMs < 80 ? 'text-emerald-400' : pingMs < 200 ? 'text-amber-400' : 'text-rose-400'} title="Round-trip latency">
+          {pingMs}ms
+        </span>
+      {/if}
       <span class="text-white/70">{clientCount !== null ? `clients: ${clientCount}` : ''}</span>
       <input type="color" bind:value={colorHex} class="h-7 w-10 cursor-pointer rounded border border-white/10 bg-transparent p-0" title="Pick color" />
       <button class="rounded bg-white/10 px-2 py-1 hover:bg-white/20" on:click={centerView}>Center</button>
