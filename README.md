@@ -30,7 +30,7 @@ Deploy the repo root. `vercel.json` sets the Express framework preset and the bu
 
 ## Architecture: three state tiers
 
-- **Tier 0 — Vercel Blob.** The canvas is persisted as zlib-deflated RGB bytes at `pixelparty/canvas.bin`. The server loads it on boot and writes it back at most every 200ms while dirty (one write in flight at a time). Requires `BLOB_READ_WRITE_TOKEN`; without it the canvas is memory-only.
+- **Tier 0 — Vercel Blob.** The canvas is persisted as zlib-deflated RGB bytes at `pixelparty/canvas.bin`. Changes only propagate upward as deltas: the server tracks which pixels it wrote, and each sync cycle (200ms while dirty, 1s idle pull while clients are connected) reads the store, adopts it for every pixel it doesn't own, then writes base + its own dirty pixels back. It never writes without a successful read first, so a blank or stale instance can't clobber the canvas; instances converge through the store. Requires `BLOB_READ_WRITE_TOKEN`; without it the canvas is memory-only. (Blob objects can't be patched in place — moving tier 0 to Redis `SETRANGE` would make the upstream leg literal deltas and close the remaining read-modify-write race.)
 - **Tier 1 — the server.** Holds the authoritative 512×512 RGB framebuffer in memory. All writes (binary chunks and legacy `set_pixel`) land here, and every 50ms the pixels written since the last tick are merged into one binary chunk and broadcast to all clients.
 - **Tier 2 — the browser.** Paints locally the moment you draw, queues the pixels (deduped), and ships them as one binary chunk per 50ms window.
 

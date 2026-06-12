@@ -5,7 +5,7 @@ import { brotliCompressSync, constants as zlib, deflateSync, inflateSync } from 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadSnapshot, saveSnapshot, storeEnabled } from './store.js';
+import { COMPACT_AFTER_DELTAS, compact, pullState, pushDelta, storeEnabled } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -47,17 +47,30 @@ function getBrotliSnapshot() {
 
 // Pixels written since the last broadcast tick: index -> packed 0xRRGGBB
 const pendingBroadcast = new Map();
-let storeDirty = false;
+// Pixels written through THIS instance and not yet persisted to tier 0.
+// Only these ever propagate upstream (as delta blobs); everything else is
+// adopted from the store so a stale or freshly-booted instance can't
+// overwrite other instances' work.
+const dirtyPixels = new Map();
+let persistingBatch = null; // dirty pixels currently being pushed upstream
+
+function ownedLocally(index) {
+  return dirtyPixels.has(index) || persistingBatch?.has(index);
+}
+
+function invalidateSnapshots() {
+  deflatedSnapshot = null;
+  brotliSnapshot = null;
+}
 
 function writePixel(index, r, g, b) {
   const i = index * 3;
   canvas[i] = r;
   canvas[i + 1] = g;
   canvas[i + 2] = b;
-  deflatedSnapshot = null;
-  brotliSnapshot = null;
+  invalidateSnapshots();
   pendingBroadcast.set(index, (r << 16) | (g << 8) | b);
-  storeDirty = true;
+  dirtyPixels.set(index, (r << 16) | (g << 8) | b);
 }
 
 // Applies a binary px chunk; returns an error code or null. The chunk is
@@ -79,6 +92,20 @@ function applyChunk(data) {
     writePixel(buf.readUIntBE(off, 3), buf[off + 3], buf[off + 4], buf[off + 5]);
   }
   return null;
+}
+
+// Encodes a Map of index -> packed 0xRRGGBB into the px wire format
+function encodeChunk(pixels) {
+  const chunk = Buffer.allocUnsafe(pixels.size * PX_RECORD);
+  let off = 0;
+  for (const [index, rgb] of pixels) {
+    chunk.writeUIntBE(index, off, 3);
+    chunk[off + 3] = (rgb >> 16) & 0xff;
+    chunk[off + 4] = (rgb >> 8) & 0xff;
+    chunk[off + 5] = rgb & 0xff;
+    off += PX_RECORD;
+  }
+  return chunk;
 }
 
 function isValidColor(color) {
@@ -192,35 +219,90 @@ io.on('connection', (socket) => {
 // server state.
 setInterval(() => {
   if (pendingBroadcast.size === 0) return;
-  const chunk = Buffer.allocUnsafe(pendingBroadcast.size * PX_RECORD);
-  let off = 0;
-  for (const [index, rgb] of pendingBroadcast) {
-    chunk.writeUIntBE(index, off, 3);
-    chunk[off + 3] = (rgb >> 16) & 0xff;
-    chunk[off + 4] = (rgb >> 8) & 0xff;
-    chunk[off + 5] = rgb & 0xff;
-    off += PX_RECORD;
-  }
+  const chunk = encodeChunk(pendingBroadcast);
   pendingBroadcast.clear();
   io.emit('px', chunk);
 }, BROADCAST_MS).unref();
 
-// Tier 1 -> tier 0: persist when dirty, never more than one write in flight.
-// With multiple function instances this is last-writer-wins on the whole
-// canvas; instances don't merge.
-if (storeEnabled()) {
-  let persisting = false;
-  setInterval(async () => {
-    if (!storeDirty || persisting) return;
-    storeDirty = false;
-    persisting = true;
+// Tier 0 sync. State flows t0 -> t1 -> t2: each cycle pulls the store's
+// base + delta log and adopts it for every pixel this instance doesn't own
+// (changed pixels fan out to clients via the broadcast tick). Upstream the
+// instance pushes ONLY its own dirty pixels as an appended delta blob —
+// appends can't conflict, so no instance can erase another's work.
+function applyRemoteState({ base, deltas }) {
+  let touched = 0;
+  const adopt = (index, r, g, b) => {
+    const i = index * 3;
+    if (canvas[i] === r && canvas[i + 1] === g && canvas[i + 2] === b) return;
+    canvas[i] = r;
+    canvas[i + 1] = g;
+    canvas[i + 2] = b;
+    pendingBroadcast.set(index, (r << 16) | (g << 8) | b);
+    touched++;
+  };
+  if (base) {
+    const remote = inflateSync(base);
+    if (remote.length === canvas.length) {
+      for (let index = 0; index < PIXEL_COUNT; index++) {
+        if (ownedLocally(index)) continue;
+        const i = index * 3;
+        adopt(index, remote[i], remote[i + 1], remote[i + 2]);
+      }
+    }
+  }
+  for (const chunk of deltas) {
+    for (let off = 0; off + PX_RECORD <= chunk.length; off += PX_RECORD) {
+      const index = chunk.readUIntBE(off, 3);
+      if (index >= PIXEL_COUNT || ownedLocally(index)) continue;
+      adopt(index, chunk[off + 3], chunk[off + 4], chunk[off + 5]);
+    }
+  }
+  if (touched > 0) invalidateSnapshots();
+  return touched;
+}
+
+let lastPull = 0;
+async function syncTier0() {
+  const state = await pullState();
+  lastPull = Date.now();
+  applyRemoteState(state);
+
+  if (dirtyPixels.size > 0) {
+    persistingBatch = new Map(dirtyPixels);
+    dirtyPixels.clear();
     try {
-      await saveSnapshot(getDeflatedSnapshot());
+      await pushDelta(encodeChunk(persistingBatch));
     } catch (err) {
-      storeDirty = true;
-      console.error('tier 0 save failed:', err.message);
+      // Re-mark for the next cycle, unless the pixel was drawn again since
+      for (const [index, rgb] of persistingBatch) {
+        if (!dirtyPixels.has(index)) dirtyPixels.set(index, rgb);
+      }
+      throw err;
     } finally {
-      persisting = false;
+      persistingBatch = null;
+    }
+  }
+
+  // Fold the log into a fresh base once it gets long, but never off an
+  // incomplete view of the deltas
+  if (state.complete && state.deltaCount >= COMPACT_AFTER_DELTAS) {
+    await compact(getDeflatedSnapshot());
+  }
+}
+
+const PULL_MS = 1000; // idle cadence for downstream refresh while clients are connected
+if (storeEnabled()) {
+  let syncing = false;
+  setInterval(async () => {
+    if (syncing) return;
+    if (dirtyPixels.size === 0 && (io.engine.clientsCount === 0 || Date.now() - lastPull < PULL_MS)) return;
+    syncing = true;
+    try {
+      await syncTier0();
+    } catch (err) {
+      console.error('tier 0 sync failed:', err.message);
+    } finally {
+      syncing = false;
     }
   }, PERSIST_MS).unref();
 } else {
@@ -230,16 +312,8 @@ if (storeEnabled()) {
 // Tier 0 -> tier 1: restore the canvas before accepting traffic
 if (storeEnabled()) {
   try {
-    const stored = await loadSnapshot();
-    if (stored) {
-      const raw = inflateSync(stored);
-      if (raw.length === canvas.length) {
-        raw.copy(canvas);
-        console.log('canvas restored from blob store');
-      } else {
-        console.error(`stored snapshot has wrong size (${raw.length}), starting blank`);
-      }
-    }
+    await syncTier0();
+    console.log('canvas restored from blob store');
   } catch (err) {
     console.error('tier 0 load failed, starting blank:', err.message);
   }

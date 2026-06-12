@@ -6,6 +6,7 @@
 
   let socket: Socket | null = null;
   let status: 'disconnected' | 'connecting' | 'connected' | 'retrying' = 'disconnected';
+  let transport: string | null = null; // 'polling' | 'websocket' | 'webtransport'
   let clientCount: number | null = null;
   let reconnectAttempts = 0;
 
@@ -48,12 +49,19 @@
       reconnectAttempts = 0;
       snapshotReady = false;
       pxBacklog = [];
+      // Socket.io starts on long-polling and upgrades in place; track which
+      // transport actually carries the connection
+      transport = socket?.io.engine.transport.name ?? null;
+      socket?.io.engine.on('upgrade', (t: { name: string }) => {
+        transport = t.name;
+      });
       void loadSnapshot();
       startPing();
     });
 
     socket.on('disconnect', () => {
       status = 'disconnected';
+      transport = null;
       pingMs = null;
       stopPing();
     });
@@ -465,6 +473,9 @@
       <span class={status === 'connected' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : status === 'retrying' ? 'text-amber-400' : 'text-rose-400'}>
         {status === 'retrying' ? `disconnected, retrying (${reconnectAttempts})` : status}
       </span>
+      {#if transport}
+        <span class="rounded bg-white/10 px-1.5 py-0.5 text-xs text-white/70" title="Active transport">{transport}</span>
+      {/if}
       {#if pingMs !== null}
         <span class={pingMs < 80 ? 'text-emerald-400' : pingMs < 200 ? 'text-amber-400' : 'text-rose-400'} title="Round-trip latency">
           {pingMs}ms
