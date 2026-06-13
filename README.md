@@ -40,12 +40,20 @@ Pixel updates use a binary `px` event in both directions: 6 bytes per pixel — 
 
 | Event (client → server) | Payload | Response |
 | --- | --- | --- |
-| `px` | binary chunk (see above) | merged into the next 50ms `px` broadcast to everyone (including the sender) |
-| `set_pixel` | `{x, y, color: [r,g,b]}` (legacy) | same as `px` |
+| `px` | binary chunk (see above) | server grants the first N pixels its budget allows (in order), merges them into the next 50ms `px` broadcast to everyone; overflow comes back as `px_rejected` |
+| `set_pixel` | `{x, y, color: [r,g,b]}` (legacy) | same budget + broadcast as `px` |
 | `get_canvas` | — | `canvas` with `{width, height, data}` where `data` is the raw RGB framebuffer, zlib-deflated (lossless). Client inflates with `DecompressionStream('deflate')`. |
 | `latency` | ack callback | server acks immediately; client measures round-trip time |
 
-Server-pushed events: `hello` (canvas size + client count), `px` (binary, coalesced), `clients` (live count), `error_msg`.
+Server-pushed events: `hello` (canvas size, region, instance id), `px` (binary, coalesced), `budget` (token bucket state), `px_rejected` (indices the budget refused), `presence` (clients here / total / instance count), `error_msg`.
+
+## Rate limit
+
+Drawing is gated by a per-IP token bucket: 5 pixels to start, refilling 1/sec up to 5, so it plays like r/place — place a few quickly, then wait. The server is authoritative (state is in-memory per instance, keyed by IP so multiple tabs share one budget; see `ratelimit.js` for the cross-instance caveat). The client mirrors the bucket for instant UI and optimistic paint, rolling back any pixel the server reports in `px_rejected`.
+
+## Presence
+
+`io.engine.clientsCount` is per-instance. Each instance heartbeats its client count to the blob store (`presence-<env>/<id>/…`, data encoded in the pathname so reads need no body fetch and dodge CDN caching) and reads the aggregate, broadcasting a `presence` event with clients-on-this-instance, total across instances, and instance count.
 
 ## Full refresh
 

@@ -3,11 +3,18 @@ import { createServer } from 'node:http';
 import { Server } from 'socket.io';
 import { brotliCompressSync, constants as zlib, deflateSync, inflateSync } from 'node:zlib';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { COMPACT_AFTER_DELTAS, compact, pullState, pushDelta, storeEnabled } from './store.js';
+import { CAPACITY, clientIp, peek, prune, take } from './ratelimit.js';
+import { presenceEnabled, syncPresence } from './presence.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Identifies this running function instance (Vercel exposes no stable id).
+const INSTANCE_ID = randomUUID().slice(0, 6);
+const REGION = process.env.VERCEL_REGION ?? 'dev';
 
 const CANVAS_WIDTH = 512;
 const CANVAS_HEIGHT = 512;
@@ -85,23 +92,21 @@ function writePixel(index, r, g, b) {
   stats.pixelsWritten++;
 }
 
-// Applies a binary px chunk; returns an error code or null. The chunk is
-// validated in full before any pixel is written so bad input is rejected
-// atomically.
-function applyChunk(data) {
-  let buf;
-  if (Buffer.isBuffer(data)) buf = data;
-  else if (data instanceof ArrayBuffer) buf = Buffer.from(data);
-  else if (ArrayBuffer.isView(data)) buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  else return 'not_binary';
+function toBuffer(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return null;
+}
 
+// Validates a binary px chunk in full before anything is written, so bad
+// input is rejected atomically. Returns an error code or null.
+function validateChunk(buf) {
+  if (!buf) return 'not_binary';
   if (buf.length === 0 || buf.length % PX_RECORD !== 0) return 'bad_length';
   if (buf.length / PX_RECORD > MAX_PIXELS_PER_CHUNK) return 'too_many_pixels';
   for (let off = 0; off < buf.length; off += PX_RECORD) {
     if (buf.readUIntBE(off, 3) >= PIXEL_COUNT) return 'out_of_bounds';
-  }
-  for (let off = 0; off < buf.length; off += PX_RECORD) {
-    writePixel(buf.readUIntBE(off, 3), buf[off + 3], buf[off + 4], buf[off + 5]);
   }
   return null;
 }
@@ -141,8 +146,10 @@ app.get('/healthz', (req, res) => {
   }
   res.json({
     ok: true,
-    region: process.env.VERCEL_REGION ?? 'dev',
+    instance: INSTANCE_ID,
+    region: REGION,
     clients: io.engine.clientsCount,
+    presence: { totalClients: presenceAgg.totalClients, instanceCount: presenceAgg.instanceCount },
     uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000),
     canvas: { width: CANVAS_WIDTH, height: CANVAS_HEIGHT, paintedPixels },
     tier0: {
@@ -185,14 +192,30 @@ if (existsSync(clientBuildDir)) {
   app.use(express.static(clientBuildDir));
 }
 
+// Sockets grouped by IP so a budget change shows in every tab the IP has open
+const socketsByIp = new Map();
+
+function emitBudget(ip) {
+  const budget = peek(ip);
+  const set = socketsByIp.get(ip);
+  if (set) for (const s of set) s.emit('budget', budget);
+}
+
 io.on('connection', (socket) => {
+  const ip = clientIp(socket);
+  let set = socketsByIp.get(ip);
+  if (!set) socketsByIp.set(ip, (set = new Set()));
+  set.add(socket);
+
   socket.emit('hello', {
     width: CANVAS_WIDTH,
     height: CANVAS_HEIGHT,
     clients: io.engine.clientsCount,
-    region: process.env.VERCEL_REGION ?? 'dev'
+    region: REGION,
+    instance: INSTANCE_ID
   });
-  io.emit('clients', io.engine.clientsCount);
+  socket.emit('budget', peek(ip));
+  broadcastPresence();
 
   // Latency probe: client measures round-trip time via the ack
   socket.on('latency', (ack) => {
@@ -207,15 +230,31 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Tier 2 -> tier 1: binary chunk of pixels batched client-side
+  // Tier 2 -> tier 1: binary chunk of pixels batched client-side. The bucket
+  // grants the first N pixels it can afford (in order); the rest are reported
+  // back so the client can roll back its optimistic paint.
   socket.on('px', (data) => {
-    const error = applyChunk(data);
+    const buf = toBuffer(data);
+    const error = validateChunk(buf);
     if (error) {
       socket.emit('error_msg', {
         error,
         message: `Expected binary chunk of ${PX_RECORD}-byte records (24-bit index, r, g, b), max ${MAX_PIXELS_PER_CHUNK} pixels, index < ${PIXEL_COUNT}`
       });
+      return;
     }
+    const count = buf.length / PX_RECORD;
+    const granted = take(ip, count);
+    for (let n = 0; n < granted; n++) {
+      const off = n * PX_RECORD;
+      writePixel(buf.readUIntBE(off, 3), buf[off + 3], buf[off + 4], buf[off + 5]);
+    }
+    if (granted < count) {
+      const rejected = [];
+      for (let n = granted; n < count; n++) rejected.push(buf.readUIntBE(n * PX_RECORD, 3));
+      socket.emit('px_rejected', rejected);
+    }
+    emitBudget(ip);
   });
 
   // Legacy single-pixel JSON protocol; feeds the same broadcast pipeline
@@ -235,13 +274,60 @@ io.on('connection', (socket) => {
       });
       return;
     }
+    if (take(ip, 1) < 1) {
+      socket.emit('error_msg', { error: 'rate_limited', message: 'Out of pixels; wait for refill' });
+      emitBudget(ip);
+      return;
+    }
     writePixel(y * CANVAS_WIDTH + x, color[0], color[1], color[2]);
+    emitBudget(ip);
   });
 
   socket.on('disconnect', () => {
-    io.emit('clients', io.engine.clientsCount);
+    const s = socketsByIp.get(ip);
+    if (s) {
+      s.delete(socket);
+      if (s.size === 0) socketsByIp.delete(ip);
+    }
+    broadcastPresence();
   });
 });
+
+setInterval(() => prune(), 60000).unref();
+
+// Cross-instance presence: heartbeat this instance's client count and read the
+// global total so the UI can show "here vs everyone across N functions".
+let presenceAgg = { totalClients: 0, instanceCount: 1 };
+
+function broadcastPresence() {
+  const localClients = io.engine.clientsCount;
+  io.emit('presence', {
+    instance: INSTANCE_ID,
+    region: REGION,
+    localClients,
+    // Our heartbeat can lag a tick; never report fewer in total than are here
+    totalClients: Math.max(presenceAgg.totalClients, localClients),
+    instanceCount: Math.max(presenceAgg.instanceCount, 1)
+  });
+}
+
+if (presenceEnabled()) {
+  let beating = false;
+  const beat = async () => {
+    if (beating) return;
+    beating = true;
+    try {
+      presenceAgg = await syncPresence(INSTANCE_ID, REGION, io.engine.clientsCount);
+      broadcastPresence();
+    } catch (err) {
+      console.error('presence sync failed:', err.message);
+    } finally {
+      beating = false;
+    }
+  };
+  setInterval(beat, 4000).unref();
+  beat();
+}
 
 // Tier 1 -> tier 2: merge everything drawn in the last tick (by any client)
 // into one binary chunk and broadcast it. Everyone gets the same packet; the
